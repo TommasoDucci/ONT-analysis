@@ -13,10 +13,19 @@ DEFAULT_GENE_BED = "/CTGlab/projects/GBM/CEINGE/old_beds/genes_coordinates_short
 
 
 def load_gene_regions(bed_path: str = DEFAULT_GENE_BED) -> pd.DataFrame:
-    """Load a 4-column BED (chr, start, end, gene) of gene coordinates."""
-    return pd.read_csv(
-        bed_path, sep="\t", header=None, names=["chr", "start", "end", "gene"]
-    )
+    """Load a BED of gene coordinates (chr, start, end, gene, ...).
+
+    Only the first four columns are used; any additional BED columns
+    (score, strand, etc.) are read but discarded.
+    """
+    bed = pd.read_csv(bed_path, sep="\t", header=None, comment="#")
+    bed = bed.iloc[:, :4]
+    bed.columns = ["chr", "start", "end", "gene"]
+    bed = bed[bed["chr"].astype(str).str.lower() != "track"]
+    bed["start"] = pd.to_numeric(bed["start"], errors="coerce")
+    bed["end"] = pd.to_numeric(bed["end"], errors="coerce")
+    bed = bed.dropna(subset=["start", "end"]).astype({"start": "int64", "end": "int64"})
+    return bed.reset_index(drop=True)
 
 
 def parse_wakhan_cna_vcf(vcf_path: str) -> pd.DataFrame:
@@ -54,11 +63,17 @@ def parse_wakhan_cna_vcf(vcf_path: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def annotate_genes_cn(vcf_path: str, gene_bed: str = DEFAULT_GENE_BED) -> pd.DataFrame:
+def annotate_genes_cn(
+    vcf_path: str, gene_bed: str = DEFAULT_GENE_BED, output_path: str | None = None
+) -> pd.DataFrame:
     """For each gene in `gene_bed`, return the overlapping CNA segment(s).
 
     A gene spanning more than one segment yields one row per overlapping
-    segment (no information is collapsed away).
+    segment (no information is collapsed away). The result includes a `cna`
+    column summarising the call (e.g. `GAIN (TCN=3, CN1=2, CN2=1)`).
+
+    If `output_path` is given, the result is also saved there (TSV if the
+    extension is `.tsv`/`.txt`, CSV otherwise).
     """
     segments = parse_wakhan_cna_vcf(vcf_path)
     genes = load_gene_regions(gene_bed)
@@ -72,24 +87,36 @@ def annotate_genes_cn(vcf_path: str, gene_bed: str = DEFAULT_GENE_BED) -> pd.Dat
         ]
         for seg in overlaps.itertuples(index=False):
             overlap_bp = min(gene.end, seg.end) - max(gene.start, seg.start)
+            seg_dict = seg._asdict()
             rows.append({
                 "gene": gene.gene,
                 "gene_chr": gene.chr,
                 "gene_start": gene.start,
                 "gene_end": gene.end,
                 "overlap_bp": overlap_bp,
-                **seg._asdict(),
+                **seg_dict,
+                "cna": (
+                    f"{seg_dict['seg_type']} "
+                    f"(TCN={seg_dict['tcn']}, CN1={seg_dict['cn1']}, CN2={seg_dict['cn2']})"
+                ),
             })
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if output_path is not None:
+        save_df(df, output_path)
+    return df
 
 
 def annotate_genes_cn_multi(
-    vcf_paths: dict[str, str], gene_bed: str = DEFAULT_GENE_BED
+    vcf_paths: dict[str, str],
+    gene_bed: str = DEFAULT_GENE_BED,
+    output_path: str | None = None,
 ) -> pd.DataFrame:
     """Run `annotate_genes_cn` across multiple samples and concatenate.
 
-    `vcf_paths` maps sample name -> VCF path.
+    `vcf_paths` maps sample name -> VCF path. If `output_path` is given, the
+    concatenated result is also saved there (TSV if the extension is
+    `.tsv`/`.txt`, CSV otherwise).
     """
     dfs = []
     for sample, path in vcf_paths.items():
@@ -97,7 +124,16 @@ def annotate_genes_cn_multi(
         df.insert(0, "sample", sample)
         dfs.append(df)
 
-    return pd.concat(dfs, ignore_index=True)
+    result = pd.concat(dfs, ignore_index=True)
+    if output_path is not None:
+        save_df(result, output_path)
+    return result
+
+
+def save_df(df: pd.DataFrame, output_path: str) -> None:
+    """Save `df` to `output_path`, using tab separation for `.tsv`/`.txt`."""
+    sep = "\t" if output_path.lower().endswith((".tsv", ".txt")) else ","
+    df.to_csv(output_path, sep=sep, index=False)
 
 
 def plot_gene_cn_heatmap(df: pd.DataFrame, value: str = "tcn"):
@@ -106,19 +142,31 @@ def plot_gene_cn_heatmap(df: pd.DataFrame, value: str = "tcn"):
     When a gene has multiple overlapping segments for a sample, the max
     value is shown (or, for seg_type, an arbitrary but deterministic pick).
     """
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+
     if value == "seg_type":
         categories = {"LOSS": 0, "CNLOH": 1, "GAIN": 2}
+        labels = list(categories.keys())
         pivot = df.pivot_table(
             index="gene", columns="sample",
             values="seg_type", aggfunc=lambda s: categories[s.iloc[0]],
         )
-        cmap = sns.color_palette(["#3b4cc0", "#dddddd", "#b40426"], as_cmap=False)
+        cmap = ListedColormap(["#3b4cc0", "#dddddd", "#b40426"])
+        norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5], cmap.N)
     else:
         pivot = df.pivot_table(index="gene", columns="sample", values=value, aggfunc="max")
         cmap = "viridis"
+        norm = None
 
     plt.figure(figsize=(max(6, pivot.shape[1] * 1.2), max(6, pivot.shape[0] * 0.4)))
-    sns.heatmap(pivot, cmap=cmap, annot=True, fmt=".2g" if value != "seg_type" else "")
+    ax = sns.heatmap(
+        pivot, cmap=cmap, norm=norm,
+        annot=value != "seg_type", fmt=".2g",
+    )
+    if value == "seg_type":
+        cbar = ax.collections[0].colorbar
+        cbar.set_ticks(list(categories.values()))
+        cbar.set_ticklabels(labels)
     plt.xticks(rotation=60, fontsize=9)
     plt.yticks(fontsize=9)
     plt.title(value)
