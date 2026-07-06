@@ -28,11 +28,14 @@ def load_gene_regions(bed_path: str = DEFAULT_GENE_BED) -> pd.DataFrame:
     return bed.reset_index(drop=True)
 
 
-def parse_wakhan_cna_vcf(vcf_path: str) -> pd.DataFrame:
+def parse_wakhan_cna_vcf(vcf_path: str, sample: str | None = None) -> pd.DataFrame:
     """Parse a Wakhan CNA VCF into one row per segment.
 
     The `ID` field is expected in the form `wakhan:<TYPE>:<chr>:<start>-<end>`,
     where `<TYPE>` is one of GAIN, LOSS, CNLOH.
+
+    If `sample` is given, a `sample` column with that name is added as the
+    first column of the result.
     """
     vcf = VCF(vcf_path)
     rows = []
@@ -60,11 +63,18 @@ def parse_wakhan_cna_vcf(vcf_path: str) -> pd.DataFrame:
             "cov2": get("COV2"),
         })
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if sample is not None:
+        df.insert(0, "sample", sample)
+    return df
 
 
 def annotate_genes_cn(
-    vcf_path: str, gene_bed: str = DEFAULT_GENE_BED, output_path: str | None = None
+    vcf_path: str,
+    gene_bed: str = DEFAULT_GENE_BED,
+    sample: str | None = None,
+    output_path: str | None = None,
+    missing_genes_output_path: str | None = None,
 ) -> pd.DataFrame:
     """For each gene in `gene_bed`, return the overlapping CNA segment(s).
 
@@ -72,19 +82,32 @@ def annotate_genes_cn(
     segment (no information is collapsed away). The result includes a `cna`
     column summarising the call (e.g. `GAIN (TCN=3, CN1=2, CN2=1)`).
 
+    If `sample` is given (e.g. `"GSC11"`), a `sample` column with that name
+    is added as the first column, so it carries through to `output_path` and
+    to downstream plots (`plot_gene_cn_heatmap`).
+
     If `output_path` is given, the result is also saved there (TSV if the
     extension is `.tsv`/`.txt`, CSV otherwise).
+
+    Genes with no overlapping CNA segment are dropped from the result (no
+    row is produced for them); their names are printed as a warning, and,
+    if `missing_genes_output_path` is given, also saved there as a one-column
+    (`gene`, plus `sample` if given) table.
     """
     segments = parse_wakhan_cna_vcf(vcf_path)
     genes = load_gene_regions(gene_bed)
 
     rows = []
+    missing_genes = []
     for gene in genes.itertuples(index=False):
         overlaps = segments[
             (segments["chr"] == gene.chr)
             & (segments["start"] <= gene.end)
             & (segments["end"] >= gene.start)
         ]
+        if overlaps.empty:
+            missing_genes.append(gene.gene)
+            continue
         for seg in overlaps.itertuples(index=False):
             overlap_bp = min(gene.end, seg.end) - max(gene.start, seg.start)
             seg_dict = seg._asdict()
@@ -101,7 +124,18 @@ def annotate_genes_cn(
                 ),
             })
 
+    if missing_genes:
+        label = f" ({sample})" if sample is not None else ""
+        print(f"No CNA segment overlaps{label}: {', '.join(missing_genes)}")
+        if missing_genes_output_path is not None:
+            missing_df = pd.DataFrame({"gene": missing_genes})
+            if sample is not None:
+                missing_df.insert(0, "sample", sample)
+            save_df(missing_df, missing_genes_output_path)
+
     df = pd.DataFrame(rows)
+    if sample is not None:
+        df.insert(0, "sample", sample)
     if output_path is not None:
         save_df(df, output_path)
     return df
@@ -111,22 +145,36 @@ def annotate_genes_cn_multi(
     vcf_paths: dict[str, str],
     gene_bed: str = DEFAULT_GENE_BED,
     output_path: str | None = None,
+    missing_genes_output_path: str | None = None,
 ) -> pd.DataFrame:
     """Run `annotate_genes_cn` across multiple samples and concatenate.
 
     `vcf_paths` maps sample name -> VCF path. If `output_path` is given, the
     concatenated result is also saved there (TSV if the extension is
     `.tsv`/`.txt`, CSV otherwise).
+
+    If `missing_genes_output_path` is given, genes with no overlapping CNA
+    segment are saved there as one row per (sample, gene), across all
+    samples in `vcf_paths`.
     """
-    dfs = []
-    for sample, path in vcf_paths.items():
-        df = annotate_genes_cn(path, gene_bed=gene_bed)
-        df.insert(0, "sample", sample)
-        dfs.append(df)
+    dfs = [
+        annotate_genes_cn(path, gene_bed=gene_bed, sample=sample)
+        for sample, path in vcf_paths.items()
+    ]
 
     result = pd.concat(dfs, ignore_index=True)
     if output_path is not None:
         save_df(result, output_path)
+
+    if missing_genes_output_path is not None:
+        all_genes = load_gene_regions(gene_bed)["gene"]
+        missing_rows = [
+            {"sample": sample, "gene": gene}
+            for sample, df in zip(vcf_paths, dfs)
+            for gene in all_genes[~all_genes.isin(df["gene"])]
+        ]
+        save_df(pd.DataFrame(missing_rows), missing_genes_output_path)
+
     return result
 
 
@@ -136,11 +184,22 @@ def save_df(df: pd.DataFrame, output_path: str) -> None:
     df.to_csv(output_path, sep=sep, index=False)
 
 
-def plot_gene_cn_heatmap(df: pd.DataFrame, value: str = "tcn"):
+def plot_gene_cn_heatmap(df: pd.DataFrame, value: str = "tcn", output_path: str | None = None):
     """Heatmap of gene x sample colored by `value` (tcn, cn1, cn2, or seg_type).
 
     When a gene has multiple overlapping segments for a sample, the max
     value is shown (or, for seg_type, an arbitrary but deterministic pick).
+
+    `df` must have a `sample` column (added automatically by
+    `annotate_genes_cn`/`annotate_genes_cn_multi` when a `sample` name is
+    passed to them); it is used both as the x-axis and in the plot title.
+
+    For `"tcn"`/`"cn1"`/`"cn2"`, no colorbar is drawn (each cell is already
+    annotated with its value); for `"seg_type"` a legend-style colorbar with
+    `LOSS`/`CNLOH`/`GAIN` labels is kept, since the cells carry no numbers.
+
+    If `output_path` is given, the figure is also saved there (format
+    inferred from the extension, e.g. `.png`/`.pdf`/`.svg`).
     """
     from matplotlib.colors import ListedColormap, BoundaryNorm
 
@@ -162,6 +221,7 @@ def plot_gene_cn_heatmap(df: pd.DataFrame, value: str = "tcn"):
     ax = sns.heatmap(
         pivot, cmap=cmap, norm=norm,
         annot=value != "seg_type", fmt=".2g",
+        cbar=value == "seg_type",
     )
     if value == "seg_type":
         cbar = ax.collections[0].colorbar
@@ -169,6 +229,10 @@ def plot_gene_cn_heatmap(df: pd.DataFrame, value: str = "tcn"):
         cbar.set_ticklabels(labels)
     plt.xticks(rotation=60, fontsize=9)
     plt.yticks(fontsize=9)
-    plt.title(value)
+    samples = df["sample"].unique()
+    title = f"{value} — {samples[0]}" if len(samples) == 1 else value
+    plt.title(title)
     plt.tight_layout()
+    if output_path is not None:
+        plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.show()
